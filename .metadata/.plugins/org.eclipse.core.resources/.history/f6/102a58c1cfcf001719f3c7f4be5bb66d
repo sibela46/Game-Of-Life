@@ -1,0 +1,523 @@
+// COMS20001 - Cellular Automaton Farm - Initial Code Skeleton
+// (using the XMOS i2c accelerometer demo code)
+
+#include <platform.h>
+#include <xs1.h>
+#include <stdio.h>
+#include "pgmIO.h"
+#include "i2c.h"
+
+#define  IMHT 256                  //image height
+#define  IMWD 256                  //image width
+
+typedef unsigned char uchar;      //using uchar as shorthand
+
+on tile[0]: port p_scl = XS1_PORT_1E;         //interface ports to orientation
+on tile[0]: port p_sda = XS1_PORT_1F;
+
+on tile[0] : in port buttons = XS1_PORT_4E; //port to access xCore-200 buttons
+on tile[0] : out port leds = XS1_PORT_4F;   //port to access xCore-200 LEDs
+
+#define FXOS8700EQ_I2C_ADDR 0x1E  //register addresses for orientation
+#define FXOS8700EQ_XYZ_DATA_CFG_REG 0x0E
+#define FXOS8700EQ_CTRL_REG_1 0x2A
+#define FXOS8700EQ_DR_STATUS 0x0
+#define FXOS8700EQ_OUT_X_MSB 0x1
+#define FXOS8700EQ_OUT_X_LSB 0x2
+#define FXOS8700EQ_OUT_Y_MSB 0x3
+#define FXOS8700EQ_OUT_Y_LSB 0x4
+#define FXOS8700EQ_OUT_Z_MSB 0x5
+#define FXOS8700EQ_OUT_Z_LSB 0x6
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Read Image from PGM file from path infname[] to channel c_out
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void DataInStream(chanend c_out)
+{
+  char infname[] = "256x256.pgm";     //put your input image path here
+  int res;
+  uchar line[ IMWD ];
+  printf( "DataInStream: Start...\n" );
+
+  //Open PGM file
+  res = _openinpgm( infname, IMWD, IMHT );
+  if( res ) {
+    printf( "DataInStream: Error openening %s\n.", infname );
+    return;
+  }
+
+  //Read image line-by-line and send byte by byte to channel c_out
+  for( int y = 0; y < IMHT; y++ ) {
+    _readinline( line, IMWD );
+    for( int x = 0; x < IMWD; x++ ) {
+      c_out <: line[ x ];
+    }
+  }
+
+  //Close PGM image file
+  _closeinpgm();
+  printf( "DataInStream: Done...\n" );
+  return;
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Check what buttons are pressed and send to distributor.
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void buttonListener(in port b, chanend toDist) {
+  int r;
+  while (1) {
+    b when pinseq(15)  :> r;    // check that no button is pressed
+    b when pinsneq(15) :> r;    // check if some buttons are pressed
+    if ((r==13) || (r==14))     // if either button is pressed
+    toDist <: r;             // send button pattern to Distributor
+  }
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Count the live neighbours of a cell, given its coordinates.
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+
+int countneighbours(int x, int y, uchar map[IMWD][IMHT/8 + 2]){
+    int number = 0;
+    for (int i=x-1; i <= x+1; i++){
+      if (i < 0) {
+          i = IMWD - 1;
+      }
+      if (i == IMWD) {
+          i = 0;
+      }
+      if (map[i][y-1] == 0xff){
+          number++;
+      }
+      if (map[i][y] == 0xff && i!= x){
+          number++;
+      }
+      if (map[i][y+1] == 0xff) {
+          number++;
+      }
+      if (i == IMWD-1 && x == 0){
+          i = x-1;
+      }
+      if (i == 0 && x == IMWD - 1){
+          i = x+2;
+      }
+    }
+    return number;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Start your implementation by changing this function to implement the game of life
+// by farming out parts of the image to worker threads who implement it...
+// Currently the function just inverts the image
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void distributor(chanend c_in, chanend c_out, chanend fromAcc[], chanend toWorker[], chanend fromButtons)
+{
+  uchar val;
+  uchar pixels[IMWD][IMHT];
+  uchar data;
+  int isTilted;
+  int trigger = 0;
+  int keepGoing = 1;
+  int startX = 0;
+  int startY = -1;
+  int startButton = 1;
+  int pressedButton = 0;
+  int flashingLed = 0;
+  int rounds = 0;
+  unsigned int startTime, currentTime;
+  unsigned int elapsedTime = 0;
+  const unsigned int period = 100000;
+  timer t;
+
+  while (startButton){
+      fromButtons :> pressedButton;
+      if (pressedButton == 14) startButton = 0;
+  }
+
+  //Starting up and wait for tilting of the xCore-200 Explorer
+  printf( "ProcessImage: Start, size = %dx%d\n", IMHT, IMWD );
+  printf( "Waiting for Board Tilt...\n" );
+
+  fromAcc[0] :> isTilted;
+
+  if (isTilted) { //assures start is triggered by a tilt.
+      trigger = 1;
+      isTilted = 0;
+  }
+
+  //Read in and do something with your image values..
+  //This just inverts every pixel, but you should
+  //change the image according to the "Game of Life"
+  printf( "Processing...\n" );
+  fromAcc[1] <: 4;
+  for (int y = 0; y < IMHT; y++ ) {   //go through all lines
+    for( int x = 0; x < IMWD; x++ ) { //go through each pixel per line
+      c_in :> val;                    //read the pixel value
+      pixels[x][y] = val;
+    }
+  }
+
+  fromAcc[1] <: 0; //reset the LED
+  t :> startTime; //get the initial time, once the processing is done
+
+  for (int i = 0; i < 8; i ++){ //divide image into 4 workers
+     int bound = startY + IMHT/8 + 2; //every worker is given 1/4 of the image + 2 extra rows - top and bottom
+
+     for (startY; startY < bound; startY++){
+         if (startY < 0){ //assures first worker is given the last row in the beginning, i.e. we sent the image in order
+             startY = IMHT - 1;
+         }
+         for (startX; startX < IMWD; startX++){
+             toWorker[i] <: pixels[startX][startY];
+          }
+         startX = 0;
+         if (startY == (IMHT - 1) && i == 0){ //assures the first worker starts from the beginning
+             startY = -1;             //of the image once it's received the last row
+         }
+         if (startY == (IMHT -1) && i == 7){ //assures the last worker receives the first row
+             startY = -1;
+         }
+         if (startY == 0 && i == 7){ //assures the last worker stops receiving after they
+             startY = bound;     //have been given the first row, i.e. we exit the for loop
+         }
+      }
+     startY -= 2; //assures the overlap and is -2 not -1 because startY gets increased by 1 in the for loop
+  }
+
+  startX = 0;
+  startY = 0;
+
+  while (trigger){ //loops forever after the first tilt has taken place
+      rounds ++;
+
+      if (flashingLed){ //flash the green led, changing its state once per processing round.
+          fromAcc[1] <: 1;
+          flashingLed = 0;
+      }
+      else {
+          fromAcc[1] <: 0;
+          flashingLed = 1;
+      }
+
+      select {
+          case fromButtons :> pressedButton:
+          if (pressedButton == 13){
+              printf("Exporting current game state...\n");
+              fromAcc[1] <: 2; //light blue LED.
+              int wait = 1;
+              while (wait){
+                  startY = 0;
+                  for (int i = 0; i < 8; i++){
+                      toWorker[i] <: 1; //tell worker to start exporting
+                  }
+                  for (int i = 0; i < 8; i ++){ //get modified image from 8 workers
+                      int bound = startY + IMHT/8;
+                      for (startY; startY < bound; startY++){
+                          for (startX = 0; startX < IMWD; startX++){
+                              toWorker[i] :> data;
+                              pixels[startX][startY] = data;
+                              c_out <: pixels[startX][startY];
+                          }
+                      }
+                      startY -= 2;
+                  }
+                  fromAcc[1] <: 0;
+                  wait = 0;
+              }
+              printf("Game exported on round %d. Total time for those rounds: %d seconds, %d milliseconds.\n", rounds, elapsedTime/1000, elapsedTime%1000);
+              trigger = 0;
+          }
+          break;
+
+          default :
+              for (int i = 0; i < 8; i++){
+                  toWorker[i] <: 0;
+              }
+          break;
+      }
+
+      t :> currentTime;
+      if (currentTime > startTime) {
+          elapsedTime += (currentTime - startTime)/ period;
+      }
+      else {
+          elapsedTime += ((UINT32_MAX - startTime)/period) + (currentTime/period);
+      }
+      startTime = currentTime;
+
+      fromAcc[0] <: 1;
+      fromAcc[0] :> isTilted;
+
+      if (isTilted){
+        fromAcc[0] <: 1;
+        fromAcc[0] :> isTilted;
+        if (isTilted){
+            printf("\n");
+            printf("Game paused.\n");
+
+            fromAcc[1] <: 8; //light red LED.
+
+            t :> currentTime;
+            if (currentTime > startTime) {
+                elapsedTime += (currentTime - startTime)/ period;
+            }
+            else {
+                elapsedTime += ((UINT32_MAX - startTime)/period) + (currentTime/period);
+            }
+            startTime = currentTime;
+
+            printf("Rounds processed: %d\n", rounds);
+            printf("Elapsed time: %d seconds, %d miliseconds\n", elapsedTime/1000, elapsedTime%1000);
+            printf("To continue: return the board back into its horizontal position.\n");
+            while (isTilted){ //stuck in this loop while the board is tilted.
+                fromAcc[0] <: 1;
+                fromAcc[0] :> isTilted;
+            }
+        }
+      }
+      else {
+
+          for (int i = 0; i < 8; i++){
+              toWorker[i] <: keepGoing; //tells the worker to keep working on the image
+          }
+
+          startY = 0;
+          for (int i = 0; i < 8; i ++){ //get modified image from 8 workers
+              int bound = startY + IMHT/8;
+              for (startY; startY < bound; startY++){
+                  for (startX = 0; startX < IMWD; startX++){
+                      toWorker[i] :> data;
+                      pixels[startX][startY] = data;
+                  }
+              }
+              startY -= 2;
+          }
+          t :> currentTime;
+          if (currentTime > startTime) {
+              elapsedTime += (currentTime - startTime)/ period;
+          }
+          else {
+              elapsedTime += ((UINT32_MAX - startTime)/period) + (currentTime/period);
+          }
+          startTime = currentTime;
+      }
+      t :> currentTime;
+      startTime = currentTime;
+  }
+  printf( "\nImage was written into a png file.\n" );
+ }
+
+void worker(chanend fromDistributor, chanend up, chanend down, int number) {
+    uchar pixel;
+    uchar cell;
+    uchar map[IMWD][IMHT/8+2];
+    uchar modified[IMWD][IMHT/8+2];
+    int liveneighbours;
+    int startX = 0;
+    int startY = 0;
+    int bound = IMHT/8 + 2;
+    int keepGoing = 0;
+    int export = 0;
+
+
+    for (startY; startY < bound; startY++){ //receiving its chunk in the beginning
+        for (startX; startX < IMWD; startX++){
+            fromDistributor :> pixel;
+            map[startX][startY] = pixel;
+            modified[startX][startY] = 0x00;
+         }
+         startX = 0;
+    }
+
+    while (1) { //forever checks if distributor needs data (loyal worker)
+        fromDistributor :> export;
+
+        if (export){ //does the distributor want me to export current image?
+            for (int y = 1; y < bound - 1; y++){
+                for (int x = 0; x < IMWD; x++){
+                    fromDistributor <: map[x][y]; //sending current image
+                }
+            }
+        }
+        else { //else keeps working on the image
+            fromDistributor :> keepGoing;
+            if (keepGoing){
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////Modify its chunk and update its chunk                                                     ////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+                                for (int y = 1; y < bound - 1; y++){ //modify its chunk
+                                    for (int x = 0; x < IMWD; x++){
+                                        cell = map[x][y];
+                                        liveneighbours = countneighbours(x, y, map);
+
+                                        if (cell == 0xff && (liveneighbours < 2 || liveneighbours > 3)){
+                                            modified[x][y] = 0x00;
+                                        }
+                                        else if (cell == 0x00 && liveneighbours == 3){
+                                            modified[x][y] = 0xff;
+                                        }
+                                        else {
+                                            modified[x][y] = cell;
+                                        }
+                                        fromDistributor <: modified[x][y];
+                                        liveneighbours = 0;
+                                    }
+                                }
+
+                                    for (int y = 1; y < bound - 1; y++){ //update its own chunk
+                                        for (int x = 0; x < IMWD; x++) {
+                                            map[x][y] = modified[x][y];
+                                        }
+                                    }
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////Exchange information with other workers.                                                      ////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+                                    if (number == 0){
+                                        for (int x = 0; x < IMWD; x++){
+                                            up <: map[x][1];
+                                            down <: map[x][bound - 2];
+                                            down :> map[x][bound - 1];
+                                            up :> map[x][0];
+                                        }
+                                    }
+                                    else {
+                                        for (int x = 0; x < IMWD; x++){
+                                            down :> map[x][bound-1];
+                                            up :> map[x][0];
+                                            up <: map[x][1];
+                                            down <: map[x][bound-2];
+                                        }
+                                    }
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Write pixel stream from channel c_in to PGM image file
+//control
+/////////////////////////////////////////////////////////////////////////////////////////
+void DataOutStream(chanend c_in)
+{
+  char outfname[] = "testout.pgm"; //put your output image path heredistribute[8]
+  int res;
+  uchar line[ IMWD ];
+
+  //Open PGM file
+  printf( "DataOutStream: Start...\n" );
+  res = _openoutpgm( outfname, IMWD, IMHT );
+  if( res ) {
+    printf( "DataOutStream: Error opening %s\n.", outfname );
+    return;
+  }
+
+  //Compile each line of the image and write the image line-by-line
+  while (1){
+      for( int y = 0; y < IMHT; y++ ) {
+        for( int x = 0; x < IMWD; x++ ) {
+          c_in :> line[ x ];
+          //printf(" %4.1d ", line[x]);
+        }
+        _writeoutline( line, IMWD );
+        //printf("\n");
+      }
+      //Close the PGM image
+      _closeoutpgm();
+      printf( "DataOutStream: Done...\n" );
+      return;
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Initialise and  read orientation, send first tilt event to channel
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+void orientation( client interface i2c_master_if i2c, out port p, chanend toDist[]) {
+  i2c_regop_res_t result;
+  char status_data = 0;
+  int triggered = 0;
+  int pattern;
+
+  // Configure FXOS8700EQ
+  result = i2c.write_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_XYZ_DATA_CFG_REG, 0x01);
+  if (result != I2C_REGOP_SUCCESS) {
+    printf("I2C write reg failed\n");
+  }
+  
+  // Enable FXOS8700EQ
+  result = i2c.write_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_CTRL_REG_1, 0x01);
+  if (result != I2C_REGOP_SUCCESS) {
+    printf("I2C write reg failed\n");
+  }
+
+  //Probe the orientation x-axis forever
+    while (1) {
+
+    //check until new orientation data is available
+    do {
+      status_data = i2c.read_reg(FXOS8700EQ_I2C_ADDR, FXOS8700EQ_DR_STATUS, result);
+    } while (!status_data & 0x08);
+
+    //get new x-axis tilt value
+    int x = read_acceleration(i2c, FXOS8700EQ_OUT_X_MSB);
+
+    if (!triggered){ //triggers the start with a tilt only in the beginning
+        if (x > 30){
+            toDist[0] <: 1;
+            triggered = 1;
+        }
+    }
+
+    select {
+        case toDist[1] :> pattern:
+            p <: pattern;
+        break;
+
+        case toDist[0] :> triggered:
+            if (x > 30) toDist[0] <: 1; //sends signals to distributor whether the board is tilted after start
+            else toDist[0] <: 0;
+        break;
+
+        default: break;
+    }
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// Orchestrate concurrent system and start up all threads
+//
+/////////////////////////////////////////////////////////////////////////////////////////
+int main(void) {
+
+i2c_master_if i2c[1];               //interface to orientation
+
+chan c_inIO, c_outIO, c_control[2], c_distribute[8], between_workers[8], c_buttons;
+
+par {
+
+    on tile[0]: DataOutStream(c_outIO);       //thread to write out a PGM image
+    on tile[0]: i2c_master(i2c, 1, p_scl, p_sda, 10);   //server thread providing orientation data
+    on tile[0]: orientation(i2c[0], leds, c_control);          //client thread reading orientation data
+    on tile[0]: buttonListener(buttons, c_buttons); //thread to read buttons
+
+    on tile[1]: DataInStream(c_inIO);          //thread to read in a PGM image
+    on tile[1]: distributor(c_inIO, c_outIO, c_control, c_distribute, c_buttons); //thread to coordinate work on image
+
+    par (int i=0; i<8; i++){
+        on tile[i%2]: worker(c_distribute[i], between_workers[(8 + (i)%8)%8], between_workers[(8 + (i+1)%8)%8], (i%2));
+    }
+  }
+  return 0;
+}
